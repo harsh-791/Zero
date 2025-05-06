@@ -28,10 +28,12 @@ export const AddConnectionDialog = ({
   const { connections, attach } = useBilling();
   const t = useTranslations();
 
-  const canCreateConnection = useMemo(() => {
-    if (!connections?.remaining && !connections?.unlimited) return false;
-    return (connections?.unlimited && !connections?.remaining) || (connections?.remaining ?? 0) > 0;
-  }, [connections]);
+  // const canCreateConnection = useMemo(() => {
+  //   if (!connections?.remaining && !connections?.unlimited) return false;
+  //   return (connections?.unlimited && !connections?.remaining) || (connections?.remaining ?? 0) > 0;
+  // }, [connections]);
+
+  const canCreateConnection = true;
 
   const handleUpgrade = async () => {
     if (attach) {
