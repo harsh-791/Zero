@@ -22,12 +22,13 @@ import * as he from 'he';
 const refreshToken = async (
   refreshTokenValue: string,
 ): Promise<{ access_token: string; refresh_token: string }> => {
-  const params = new URLSearchParams();
-  params.append('client_id', process.env.MICROSOFT_CLIENT_ID as string);
-  params.append('client_secret', process.env.MICROSOFT_CLIENT_SECRET as string);
-  params.append('refresh_token', refreshTokenValue);
-  params.append('redirect_uri', process.env.MICROSOFT_REDIRECT_URI as string);
-  params.append('grant_type', 'refresh_token');
+  const params = new URLSearchParams({
+    client_id: process.env.MICROSOFT_CLIENT_ID as string,
+    client_secret: process.env.MICROSOFT_CLIENT_SECRET as string,
+    refresh_token: refreshTokenValue,
+    redirect_uri: process.env.MICROSOFT_REDIRECT_URI as string,
+    grant_type: 'refresh_token',
+  });
 
   const tokenRes = await fetch('https://login.microsoftonline.com/common/oauth2/v2.0/token', {
     method: 'POST',
