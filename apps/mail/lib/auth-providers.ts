@@ -50,7 +50,7 @@ export const authProviders: ProviderConfig[] = [
   },
   {
     id: 'microsoft',
-    name: 'Microsoft',
+    name: 'Outlook',
     requiredEnvVars: ['MICROSOFT_CLIENT_ID', 'MICROSOFT_CLIENT_SECRET'],
     envVarInfo: [
       { name: 'MICROSOFT_CLIENT_ID', source: 'Microsoft Azure App ID' },
