@@ -33,6 +33,7 @@ export const AddConnectionDialog = ({
   //   return (connections?.unlimited && !connections?.remaining) || (connections?.remaining ?? 0) > 0;
   // }, [connections]);
 
+  // TODO: CHANGE BEFORE MERGE
   const canCreateConnection = true;
 
   const handleUpgrade = async () => {
