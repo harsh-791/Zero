@@ -11,49 +11,64 @@ import {
   sanitizeContext,
   StandardizedError,
 } from './utils';
-import { Client, type AuthenticationProvider } from '@microsoft/microsoft-graph-client';
 import type { IOutgoingMessage, Label, ParsedMessage } from '@/types';
 import { sanitizeTipTapHtml } from '../sanitize-tip-tap-html';
+import { Client } from '@microsoft/microsoft-graph-client';
 import type { MailManager, ManagerConfig } from './types';
 import { withExponentialBackoff } from '@/app/api/utils';
 import type { CreateDraftData } from '../schemas';
-import { getHeaders } from '@better-fetch/fetch';
-import { auth } from '../auth';
 import * as he from 'he';
 
-class MsalAuthenticationProvider implements AuthenticationProvider {
-  async getAccessToken(): Promise<string> {
-    const session = await auth.api.getSession({
-      headers: await getHeaders(),
-    });
-    if (!session) {
-      throw new Error('No active session found');
-    }
-    return session.session.token;
+const refreshToken = async (
+  refreshTokenValue: string,
+): Promise<{ access_token: string; refresh_token: string }> => {
+  const params = new URLSearchParams();
+  params.append('client_id', process.env.MICROSOFT_CLIENT_ID as string);
+  params.append('client_secret', process.env.MICROSOFT_CLIENT_SECRET as string);
+  params.append('refresh_token', refreshTokenValue);
+  params.append('redirect_uri', process.env.MICROSOFT_REDIRECT_URI as string);
+  params.append('grant_type', 'refresh_token');
+
+  const tokenRes = await fetch('https://login.microsoftonline.com/common/oauth2/v2.0/token', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: params.toString(),
+  });
+
+  if (!tokenRes.ok) {
+    const errorText = await tokenRes.text();
+    throw new Error(`Refresh token exchange failed: ${errorText}`);
   }
 
-  constructor(private config?: { headers?: HeadersInit }) {}
-}
+  const tokenData = await tokenRes.json();
+  return {
+    access_token: tokenData.access_token,
+    refresh_token: tokenData.refresh_token,
+  };
+};
 
 export class OutlookMailManager implements MailManager {
   private graphClient: Client;
 
   constructor(public config: ManagerConfig) {
-    const authProvider = new MsalAuthenticationProvider();
-
     this.graphClient = Client.initWithMiddleware({
       authProvider: {
         getAccessToken: async () => {
-          return authProvider.getAccessToken();
+          return refreshToken(this.config.auth?.refreshToken as string).then(
+            (res) => res.access_token,
+          );
         },
       },
     });
   }
 
   public getScope(): string {
-    return ['Mail.Read', 'Mail.ReadWrite', 'Mail.Send', 'User.Read'].join(' ');
+    return [
+      'https://graph.microsoft.com/User.Read https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send offline_access',
+    ].join(' ');
   }
-
   public getAttachment(messageId: string, attachmentId: string) {
     return this.withErrorHandler(
       'getAttachment',
@@ -75,7 +90,6 @@ export class OutlookMailManager implements MailManager {
       { messageId, attachmentId },
     );
   }
-
   public getEmailAliases() {
     return this.withErrorHandler('getEmailAliases', async () => {
       const user: User = await this.graphClient.api('/me').select('mail,userPrincipalName').get();
@@ -88,7 +102,6 @@ export class OutlookMailManager implements MailManager {
       return aliases;
     });
   }
-
   public markAsRead(messageIds: string[]) {
     return this.withErrorHandler(
       'markAsRead',
@@ -98,7 +111,6 @@ export class OutlookMailManager implements MailManager {
       { messageIds },
     );
   }
-
   public markAsUnread(messageIds: string[]) {
     return this.withErrorHandler(
       'markAsUnread',
@@ -108,7 +120,6 @@ export class OutlookMailManager implements MailManager {
       { messageIds },
     );
   }
-
   private async modifyMessageReadStatus(messageIds: string[], isRead: boolean) {
     if (messageIds.length === 0) {
       return;
@@ -129,7 +140,6 @@ export class OutlookMailManager implements MailManager {
       throw error;
     }
   }
-
   public getUserInfo() {
     return this.withErrorHandler(
       'getUserInfo',
@@ -147,15 +157,14 @@ export class OutlookMailManager implements MailManager {
         }
 
         return {
-          address: '',
-          name: '',
-          photo: '',
+          address: user.mail || user.userPrincipalName || '',
+          name: user.displayName || '',
+          photo: photoUrl,
         };
       },
       {},
     );
   }
-
   public getTokens<T>(code: string) {
     return this.withErrorHandler(
       'getTokens',
@@ -169,7 +178,6 @@ export class OutlookMailManager implements MailManager {
       { code },
     );
   }
-
   public count() {
     return this.withErrorHandler(
       'count',
@@ -193,7 +201,6 @@ export class OutlookMailManager implements MailManager {
       { email: this.config.auth?.email },
     );
   }
-
   public list(params: {
     folder: string;
     query?: string;
@@ -208,14 +215,14 @@ export class OutlookMailManager implements MailManager {
       folderId = folder;
     }
 
-    let request = this.graphClient.api(`/me/mailfolders/${folderId}/messages`);
+    let request = this.graphClient.api(`/me/mailFolders/${folderId}/messages`).top(maxResults);
 
     if (q) {
       request = request.search(`"${q}"`);
     }
 
     request = request.select(
-      'id,subject,from,toRecipients,ccRecipients,bccRecipients,sentDateTime,receivedDateTime,isRead,conversationId,internetMessageId,inferenceClassification,categories,parentFolderId,size',
+      'id,subject,from,toRecipients,ccRecipients,bccRecipients,sentDateTime,receivedDateTime,isRead,conversationId,internetMessageId,inferenceClassification,categories,parentFolderId',
     );
 
     if (maxResults > 0) {
@@ -241,10 +248,37 @@ export class OutlookMailManager implements MailManager {
           messages.map((msg) => this.parseOutlookMessage(msg)),
         );
 
-        const threads = parsedMessages.map((msg) => ({
-          id: msg.threadId || msg.id,
-          $raw: msg,
-        }));
+        const threads = await Promise.all(
+          (parsedMessages || []).map(
+            async (
+              message: Omit<
+                ParsedMessage,
+                'body' | 'processedHtml' | 'blobUrl' | 'totalReplies' | 'attachments'
+              >,
+            ) => {
+              const sender = message.sender;
+              const senderName = sender?.name || 'Unknown';
+              const senderEmail = `<${sender?.email}>`;
+
+              return {
+                id: message.id,
+                title: message.subject || '',
+                tags: [],
+                sender: {
+                  name: senderName,
+                  email: senderEmail,
+                },
+                unread: message.unread === false,
+                receivedOn: message.receivedOn,
+                subject: message.subject,
+                body: '',
+                processedHtml: '',
+                blobUrl: '',
+                totalReplies: 0,
+              };
+            },
+          ),
+        );
 
         return {
           threads: threads,
@@ -261,7 +295,6 @@ export class OutlookMailManager implements MailManager {
       },
     );
   }
-
   private getOutlookFolderId(folderName: string): string | undefined {
     switch (folderName.toLowerCase()) {
       case 'inbox':
@@ -281,7 +314,6 @@ export class OutlookMailManager implements MailManager {
         return undefined;
     }
   }
-
   public get(id: string) {
     return this.withErrorHandler(
       'get',
@@ -360,7 +392,6 @@ export class OutlookMailManager implements MailManager {
       { id, email: this.config.auth?.email },
     );
   }
-
   public create(data: IOutgoingMessage) {
     return this.withErrorHandler(
       'create',
@@ -377,7 +408,6 @@ export class OutlookMailManager implements MailManager {
       { data, email: this.config.auth?.email },
     );
   }
-
   public delete(id: string) {
     return this.withErrorHandler(
       'delete',
@@ -387,7 +417,6 @@ export class OutlookMailManager implements MailManager {
       { id },
     );
   }
-
   public normalizeIds(ids: string[]) {
     return this.withSyncErrorHandler(
       'normalizeIds',
@@ -400,7 +429,6 @@ export class OutlookMailManager implements MailManager {
       { ids },
     );
   }
-
   public modifyLabels(
     messageIds: string[],
     options: { addLabels: string[]; removeLabels: string[] },
@@ -417,7 +445,6 @@ export class OutlookMailManager implements MailManager {
       { messageIds, options },
     );
   }
-
   private async modifyMessageLabelsOrFolders(
     messageIds: string[],
     addItems: string[],
@@ -474,7 +501,6 @@ export class OutlookMailManager implements MailManager {
       throw error;
     }
   }
-
   public sendDraft(draftId: string, data: IOutgoingMessage) {
     return this.withErrorHandler(
       'sendDraft',
@@ -484,7 +510,6 @@ export class OutlookMailManager implements MailManager {
       { draftId, data },
     );
   }
-
   public getDraft(draftId: string) {
     return this.withErrorHandler(
       'getDraft',
@@ -508,7 +533,6 @@ export class OutlookMailManager implements MailManager {
       { draftId },
     );
   }
-
   public listDrafts(params: { q?: string; maxResults?: number; pageToken?: string }) {
     const { q, maxResults = 20, pageToken } = params;
     return this.withErrorHandler(
@@ -574,7 +598,6 @@ export class OutlookMailManager implements MailManager {
       { q, maxResults, pageToken },
     );
   }
-
   public createDraft(data: CreateDraftData) {
     return this.withErrorHandler(
       'createDraft',
@@ -596,7 +619,6 @@ export class OutlookMailManager implements MailManager {
       { data },
     );
   }
-
   public async getUserLabels() {
     console.warn(
       'getUserLabels maps to Outlook Categories and Mail Folders, which have different APIs.',
@@ -634,7 +656,6 @@ export class OutlookMailManager implements MailManager {
       return [];
     }
   }
-
   public async getLabel(labelId: string): Promise<Label> {
     console.warn('getLabel needs to differentiate between Category ID and Mail Folder ID.');
 
@@ -668,7 +689,6 @@ export class OutlookMailManager implements MailManager {
       }
     }
   }
-
   public async createLabel(label: {
     name: string;
     color?: { backgroundColor: string; textColor: string };
@@ -684,7 +704,7 @@ export class OutlookMailManager implements MailManager {
       });
       console.log('Mail Folder created:', newFolder);
 
-      // If you wanted to create a Category:
+      // create a Category:
       // const newCategory: Category = await this.graphClient.api('/me/outlook/masterCategories').post({
       //     displayName: label.name,
       //      color: 'presetColorEnum' // Graph category color is a string enum
@@ -695,7 +715,6 @@ export class OutlookMailManager implements MailManager {
       throw error;
     }
   }
-
   public async updateLabel(id: string, label: Label) {
     console.warn('updateLabel needs to differentiate between Category and Mail Folder updates.');
 
@@ -722,11 +741,9 @@ export class OutlookMailManager implements MailManager {
       }
     }
   }
-
   public async deleteLabel(id: string) {
     await this.graphClient.api(`/me/mailfolders/${id}`).delete();
   }
-
   public async revokeRefreshToken(refreshToken: string) {
     if (!refreshToken) {
       return false;
@@ -743,16 +760,16 @@ export class OutlookMailManager implements MailManager {
   }
   private async modifyThreadLabels(
     threadIds: string[],
-    requestBody: any, // Gmail-specific type, replace with relevant Outlook/Graph logic
+    requestBody: any, // Gmail-specific type, replace with relevant Outlook logic
   ) {
     // This method is Gmail-specific (modifying thread labels).
-    // The equivalent in Outlook/Graph is modifying messages (read status, categories)
+    // The equivalent in Outlook is modifying messages (read status, categories)
     // or moving messages between folders.
     // The logic from modifyMessageReadStatus and modifyMessageLabelsOrFolders is more relevant.
     console.warn(
       'modifyThreadLabels is a Gmail-specific concept. Use modifyMessageReadStatus or modifyMessageLabelsOrFolders.',
     );
-    // Placeholder to prevent errors if called
+    // Placeholder
     return Promise.resolve();
   }
   private normalizeSearch(folder: string, q: string) {
@@ -784,7 +801,6 @@ export class OutlookMailManager implements MailManager {
         folderId = 'drafts';
         break;
       default:
-        // Assume folder name is a potential folder ID for custom folders
         folderId = folder;
         break;
     }
@@ -813,8 +829,8 @@ export class OutlookMailManager implements MailManager {
     internetMessageId,
     inferenceClassification, // Might indicate if junk
     categories, // Outlook categories map to tags
-    parentFolderId, // Can indicate folder (e.g., 'deleteditems')
-    // headers, // Array of Header objects (name, value)
+    parentFolderId, // Can indicate folder (e.g. 'deleteditems')
+    // headers, // Array of Header objects (name, value), doesn't exist in Outlook
   }: Message): Omit<
     ParsedMessage,
     'body' | 'processedHtml' | 'blobUrl' | 'totalReplies' | 'attachments'
@@ -863,6 +879,7 @@ export class OutlookMailManager implements MailManager {
     let listUnsubscribePost: string | undefined;
     let replyTo: string | undefined;
 
+    // TODO: use headers if available
     // if (headers) {
     //   const referencesHeader = headers.find((h) => h.name?.toLowerCase() === 'references');
     //   if (referencesHeader) references = referencesHeader.value || undefined;
@@ -906,12 +923,11 @@ export class OutlookMailManager implements MailManager {
       unread: !isRead,
       to,
       cc,
-      receivedOn: receivedOn.toString(), // Ensure it's a string
+      receivedOn: receivedOn.toString(),
       subject: subject ? he.decode(subject).trim() : '(no subject)',
       messageId: internetMessageId || id || 'ERROR',
     };
   }
-
   private async parseOutgoingOutlook({
     to,
     subject,
@@ -1025,7 +1041,6 @@ export class OutlookMailManager implements MailManager {
       rawMessage: draftMessage, // Include raw Graph message
     };
   }
-
   private async withErrorHandler<T>(
     operation: string,
     fn: () => Promise<T> | T,
@@ -1053,7 +1068,6 @@ export class OutlookMailManager implements MailManager {
       throw new StandardizedError(error, operation, context);
     }
   }
-
   private withSyncErrorHandler<T>(
     operation: string,
     fn: () => T,
